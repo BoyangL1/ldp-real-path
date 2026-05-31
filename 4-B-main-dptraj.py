@@ -95,10 +95,11 @@ def main(config, logger, exp_dir):
         drop_last=False
     )
 
+    # Data is fully in-memory (TensorDataset); workers add IPC/pickle overhead for tiny batches.
     dataloader = DataLoader(
         dataset,
         batch_sampler=batch_sampler,
-        num_workers=8,
+        num_workers=0,
         pin_memory=True
     )
     # Training params
@@ -108,8 +109,12 @@ def main(config, logger, exp_dir):
                           config.diffusion.beta_end, n_steps).cuda()
     alpha = 1. - beta
     alpha_bar = torch.cumprod(alpha, dim=0)
-    base_lr = 1e-4  
-    weight_decay = 1e-4 
+    # Adaptive LR: sqrt scaling rule anchored at batch_size=128 -> 1e-4.
+    # Larger batch -> smaller gradient noise -> proportionally larger LR.
+    LR_REF, BATCH_REF = 1e-4, 128
+    base_lr = LR_REF * math.sqrt(config.training.batch_size / BATCH_REF)
+    weight_decay = 1e-4
+    logger.info(f"Adaptive base_lr={base_lr:.2e} (batch_size={config.training.batch_size}, ref={BATCH_REF}->{LR_REF:.0e})")
 
     losses = []  # Store losses for later plotting
     # optimizer
@@ -136,8 +141,6 @@ def main(config, logger, exp_dir):
     for epoch in range(1, config.training.n_epochs + 1):
         logger.info("<----Epoch-{}---->".format(epoch))
         for iter_idx, (trainx, head, priv) in enumerate(dataloader):
-            if iter_idx % 1 == 0:
-                logger.info(f"privacy[min,max]=({priv.min().item()},{priv.max().item()})")
             x0 = trainx.cuda()
             head = head.cuda()
             # t = torch.randint(low=0, high=n_steps,
@@ -155,21 +158,27 @@ def main(config, logger, exp_dir):
             pred_noise = unet(xt.float(), t, head)
             # Compare the predictions with the targets
             loss = F.mse_loss(noise.float(), pred_noise)
-            # Store the loss for later viewing
-            losses.append(loss.item())
+            # Accumulate on-GPU (detached) to avoid a CPU sync every iteration.
+            losses.append(loss.detach())
             optim.zero_grad()
             loss.backward()
             optim.step()
             if config.model.ema:
                 ema_helper.update(unet)
-            
-            logger.info(f"Epoch {epoch}, Iter {iter_idx}, Loss: {loss.item():.6f}")
+
+            # Logging (throttled; .item() here is the only per-window sync)
+            if iter_idx % 50 == 0:
+                logger.info(
+                    f"Epoch {epoch}, Iter {iter_idx}, Loss: {loss.item():.6f}, "
+                    f"privacy[min,max]=({priv.min().item()},{priv.max().item()})"
+                )
         scheduler.step()
-        if (epoch) % 500 == 0:
+        if (epoch) % 200 == 0:
             m_path = model_save / f"unet_{epoch}.pt"
             torch.save(unet.state_dict(), m_path)
             m_path = exp_dir / 'results' / f"loss_{epoch}.npy"
-            np.save(m_path, np.array(losses))
+            losses_np = torch.stack(losses).cpu().numpy()
+            np.save(m_path, losses_np)
 
 
 if __name__ == "__main__":

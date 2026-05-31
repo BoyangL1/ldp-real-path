@@ -109,8 +109,12 @@ def main(config, logger, exp_dir):
     # ----------------------------------------
     unet = Guide_UNet(config).cuda()
     
-    base_lr = 1e-4  
+    # Adaptive LR: sqrt scaling rule anchored at batch_size=128 -> 1e-4.
+    # Larger batch -> smaller gradient noise -> proportionally larger LR.
+    LR_REF, BATCH_REF = 1e-4, 128
+    base_lr = LR_REF * math.sqrt(config.training.batch_size / BATCH_REF)
     weight_decay = 1e-4
+    logger.info(f"Adaptive base_lr={base_lr:.2e} (batch_size={config.training.batch_size}, ref={BATCH_REF}->{LR_REF:.0e})")
     optim = torch.optim.AdamW(unet.parameters(), lr=base_lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optim, T_max=config.training.n_epochs, eta_min=1e-6
@@ -140,7 +144,8 @@ def main(config, logger, exp_dir):
     
     # Use Custom Sampler
     batch_sampler = TimeSortBatchSampler(time_all, batch_size=config.training.batch_size)
-    dataloader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=8)
+    # Data is fully in-memory (TensorDataset); workers add IPC/pickle overhead for tiny batches.
+    dataloader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=0)
 
     # ----------------------------------------
     # D. Training Loop
@@ -173,17 +178,18 @@ def main(config, logger, exp_dir):
             
             # 7. Optimization
             loss = F.mse_loss(noise.float(), pred_noise)
-            epoch_losses.append(loss.item())
-            
+            # Accumulate on-GPU (detached) to avoid a CPU sync every iteration.
+            epoch_losses.append(loss.detach())
+
             optim.zero_grad()
             loss.backward()
             optim.step()
-            
+
             if config.model.ema:
                 ema_helper.update(unet)
-            
-            # Logging
-            if iter_idx % 1 == 0:
+
+            # Logging (throttled; .item() here is the only per-window sync)
+            if iter_idx % 50 == 0:
                 logger.info(
                     f"Epoch {epoch}, Iter {iter_idx}, Loss: {loss.item():.6f}, "
                     f"t_i[min,max]=({t_i.min().item()},{t_i.max().item()})"
@@ -191,12 +197,13 @@ def main(config, logger, exp_dir):
 
         scheduler.step()
         # End of Epoch Saving
-        if (epoch) % 500 == 0:
+        if (epoch) % 200 == 0:
             m_path = model_save_dir / f"unet_{epoch}.pt"
             torch.save(unet.state_dict(), m_path)
             
             loss_path = exp_dir / 'results' / f"loss_{epoch}.npy"
-            np.save(loss_path, np.array(epoch_losses))
+            losses_np = torch.stack(epoch_losses).cpu().numpy()
+            np.save(loss_path, losses_np)
 
 # ==============================================================================
 # 3. Entry Point
