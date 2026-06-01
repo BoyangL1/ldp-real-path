@@ -62,6 +62,14 @@ python 1-split-traj.py --input data/traj_4cities/sim_nagoya_20231001_20231007.cs
 python 1-split-traj.py --input data/traj_4cities/sim_sapporo_20231001_20231007.csv.gz
 ```
 
+Large cities produce far more trajectories than training needs (Tokyo ~4M). Cap the
+number of **whole** trajectories kept with `--max-traj` (seeded, reproducible) — this
+shrinks the compact CSV so step 3 and all of step 4's training run on ≤100k samples:
+
+```bash
+python 1-split-traj.py --input data/traj_4cities/sim_tokyo_20231001_20231007.csv.gz --max-traj 100000
+```
+
 ## 2 — Visualize trajectories
 
 ```bash

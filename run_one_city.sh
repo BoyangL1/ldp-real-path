@@ -55,7 +55,9 @@ python 0-grid_privacy.py \
     --min-lat "${S}" --max-lat "${N}"
 
 # Step 1 — split full-week CSV into per-user/day trajectories.
-python 1-split-traj.py --input "${TRAJ_CSV}"
+# Optionally cap whole trajectories (e.g. MAX_TRAJ=100000 for large cities like tokyo)
+# so step 3 + training stay fast. Unset/empty -> no cap.
+python 1-split-traj.py --input "${TRAJ_CSV}" ${MAX_TRAJ:+--max-traj "${MAX_TRAJ}"}
 
 # Step 2 — quick visual sanity check.
 mkdir -p figs

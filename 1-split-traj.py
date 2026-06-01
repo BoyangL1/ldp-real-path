@@ -56,6 +56,8 @@ Usage:
     python 1-split-traj.py
     python 1-split-traj.py --min-stay-sec 900
     python 1-split-traj.py --input data/sim_nagoya_20230426.csv.gz
+    # cap large cities to <=100k trajectories so step 3 + training stay fast:
+    python 1-split-traj.py --input .../sim_tokyo_..._.csv.gz --max-traj 100000
 """
 from __future__ import annotations
 
@@ -150,6 +152,13 @@ def main() -> None:
     ap.add_argument("--min-stay-sec", type=int, default=600,
                     help="a location-run this long (seconds) counts as a stay that ends "
                          "the current trajectory (default: 600)")
+    ap.add_argument("--max-traj", type=int, default=None,
+                    help="cap the number of MOVING trajectories kept by randomly "
+                         "subsampling whole trajectories down to this many (default: no cap). "
+                         "Large cities (e.g. tokyo ~4M) produce far more trajectories than "
+                         "needed; capping here shrinks step 3 and training.")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="random seed for --max-traj subsampling (default: 42)")
     args = ap.parse_args()
 
     if args.output is None:
@@ -201,6 +210,25 @@ def main() -> None:
         f"[compact] dwell_sec: mean={compact_df['dwell_sec'].mean():.0f}, "
         f"median={compact_df['dwell_sec'].median():.0f}, max={compact_df['dwell_sec'].max()}"
     )
+
+    # Optional cap: randomly keep at most --max-traj whole trajectories. We sample
+    # the surviving (moving-only) trajectory keys, then filter BOTH outputs to that
+    # set so per-ping and compact stay consistent. Sampling entire trajectories
+    # (never points) is the standard unbiased way to subsample a diffusion train set.
+    if args.max_traj is not None and n_traj_after > args.max_traj:
+        keys = (
+            compact_df[tj_key]
+            .drop_duplicates()
+            .sample(n=args.max_traj, random_state=args.seed)
+            .reset_index(drop=True)
+        )
+        compact_df = compact_df.merge(keys, on=tj_key, how="inner").reset_index(drop=True)
+        per_ping = per_ping.merge(keys, on=tj_key, how="inner").reset_index(drop=True)
+        print(
+            f"[cap] --max-traj {args.max_traj:,}: trajectories {n_traj_after:,} -> "
+            f"{args.max_traj:,} (seed={args.seed}); compact rows {len(compact_df):,}, "
+            f"per-ping rows {len(per_ping):,}"
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     print(f"[write] {args.output}")
