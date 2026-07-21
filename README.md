@@ -132,6 +132,53 @@ python 5-B-traj_gen_iterative_dp.py  --head_path data/traj_privacy/nagoya/trajec
 python 5-B-traj_gen_iterative_dp.py  --head_path data/traj_privacy/sapporo/trajectory_features.npy --root ./DPTraj_sapporo --result_root ./DP_result_sapporo --noise_prefix sapporo_noise_
 ```
 
+## 5-A2 — Retrieval-guided LDP generation (guidance-level sweep)
+
+For each city, loop over the guidance levels; every level is saved to its own
+sub-folder `<result_root>/<run_tag>/guide_<level>/`.
+
+```bash
+for gl in 0.1 0.3 0.5 0.7 0.9 1.0; do
+python 5-A2-traj_gen_retrieval_guided_ldp.py --noise_prefix tokyo_noise_ --guide_lambdas $gl \
+    --traj_path       data/traj_privacy/tokyo/noise_sweep/noise_0.00/traj.npy \
+    --head_path       data/traj_privacy/tokyo/trajectory_features.npy \
+    --train_head_dir  data/traj_privacy/tokyo/noise_sweep \
+    --root            ./LDP-DiffTraj_tokyo \
+    --result_root     ./LDP_result_tokyo_guided
+done
+
+for gl in 0.1 0.3 0.5 0.7 0.9 1.0; do
+python 5-A2-traj_gen_retrieval_guided_ldp.py --noise_prefix osaka_noise_ --guide_lambdas $gl \
+    --traj_path       data/traj_privacy/osaka/noise_sweep/noise_0.00/traj.npy \
+    --head_path       data/traj_privacy/osaka/trajectory_features.npy \
+    --train_head_dir  data/traj_privacy/osaka/noise_sweep \
+    --root            ./LDP-DiffTraj_osaka \
+    --result_root     ./LDP_result_osaka_guided
+done
+
+for gl in 0.1 0.3 0.5 0.7 0.9 1.0; do
+python 5-A2-traj_gen_retrieval_guided_ldp.py --noise_prefix nagoya_noise_ --guide_lambdas $gl \
+    --traj_path       data/traj_privacy/nagoya/noise_sweep/noise_0.00/traj.npy \
+    --head_path       data/traj_privacy/nagoya/trajectory_features.npy \
+    --train_head_dir  data/traj_privacy/nagoya/noise_sweep \
+    --root            ./LDP-DiffTraj_nagoya \
+    --result_root     ./LDP_result_nagoya_guided
+done
+
+for gl in 0.1 0.3 0.5 0.7 0.9 1.0; do
+python 5-A2-traj_gen_retrieval_guided_ldp.py --noise_prefix sapporo_noise_ --guide_lambdas $gl \
+    --traj_path       data/traj_privacy/sapporo/noise_sweep/noise_0.00/traj.npy \
+    --head_path       data/traj_privacy/sapporo/trajectory_features.npy \
+    --train_head_dir  data/traj_privacy/sapporo/noise_sweep \
+    --root            ./LDP-DiffTraj_sapporo \
+    --result_root     ./LDP_result_sapporo_guided
+done
+```
+
+One level per run (`--guide_lambdas $gl`); pass several (`0.1,0.3`) to sweep in a
+single invocation instead. Evaluate with step 6 by pointing `--gen_dir` at a
+specific `guide_<level>/` folder.
+
 ## 6 — Evaluate metrics (LDP + DP per city)
 
 ```bash
