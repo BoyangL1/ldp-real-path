@@ -14,6 +14,7 @@ from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 from scipy.special import rel_entr
 from skimage.metrics import structural_similarity as ssim
+from utils.reference_metrics import od_ssim as reference_ssim, od_jsd as reference_od_jsd, len_jsd as step_jsd
 
 
 # ==========================================================
@@ -46,7 +47,9 @@ def parse_args():
 
 cli = parse_args()
 OUT_CSV = cli.out_csv or os.path.join(cli.gen_dir, "metrics_summary.csv")
-os.makedirs(cli.gen_dir, exist_ok=True)
+if not os.path.isdir(cli.gen_dir):
+    raise FileNotFoundError(f'Generated trajectory directory does not exist: {cli.gen_dir}')
+os.makedirs(os.path.dirname(os.path.abspath(OUT_CSV)), exist_ok=True)
 
 # ==========================================================
 # 1. Load real trajectories (privacy-filtered, same as gen scripts)
@@ -57,6 +60,10 @@ privacy_budget = features[:, -1]
 priv_idx = np.where(privacy_budget > 1e-8)[0]
 
 real_traj_full = np.load(cli.real_traj_file)
+if real_traj_full.ndim != 3 or real_traj_full.shape[-1] != 2 or len(real_traj_full) != len(features):
+    raise ValueError('Expected aligned reference [N,T,2] and feature [N,D] arrays')
+if not len(priv_idx) or not np.isfinite(real_traj_full).all():
+    raise ValueError('Reference must be finite and contain private trajectories')
 real_traj = real_traj_full[priv_idx]
 sens_scores = privacy_budget[priv_idx]
 
@@ -186,7 +193,7 @@ def topk_f1(real, gen):
 #    A) <gen_dir>/Gen_traj_noise_<X.XX>.pkl                (DiffTraj outputs)
 #    B) <gen_dir>/noise_<X.XX>/traj.npy                    (raw noise_sweep)
 # ==========================================================
-PKL_PAT = re.compile(r"Gen_traj_noise_([0-9.]+)\.pkl$")
+PKL_PAT = re.compile(r"Gen_traj_noise_([0-9.]+)(?:_guided)?\.pkl$")
 DIR_PAT = re.compile(r"noise_([0-9.]+)$")
 
 
@@ -217,6 +224,10 @@ def load_traj(kind, path):
 
 
 sources = discover_traj_sources(cli.gen_dir)
+if not sources:
+    raise ValueError(f'No trajectory files found in {cli.gen_dir}; point --gen_dir at guide_1/, not its parent')
+if len({n for n, _, _ in sources}) != len(sources):
+    raise ValueError('Multiple files for the same noise level; evaluate each method in its own directory')
 print(f"\nFound {len(sources)} trajectory source(s) in {cli.gen_dir}")
 records = []
 
@@ -228,7 +239,9 @@ for noise, kind, path in tqdm(sources):
     if kind == "npy" and len(gen_traj) == len(features):
         gen_traj = gen_traj[priv_idx]
 
-    n = min(len(real_traj), len(gen_traj))
+    if gen_traj.shape != real_traj.shape or not np.isfinite(gen_traj).all():
+        raise ValueError(f'{path}: expected finite trajectories of shape {real_traj.shape}, got {gen_traj.shape}')
+    n = len(real_traj)
     real_sub = real_traj[:n]
     gen_sub = gen_traj[:n]
     hs_mask = high_sens_mask[:n]
@@ -271,6 +284,10 @@ for noise, kind, path in tqdm(sources):
         "length_jsd": l_jsd,
         "od_jsd_high_sens": od_jsd_hs,
         "occupancy_jsd_high_sens": occ_jsd_hs,
+        "od_ssim_vst": reference_ssim(real_sub, gen_sub, 'vst'),
+        "od_jsd": reference_od_jsd(real_sub, gen_sub),
+        "step_length_jsd": step_jsd(real_sub, gen_sub),
+        "n_trajectories": n,
     })
 
 # ==========================================================

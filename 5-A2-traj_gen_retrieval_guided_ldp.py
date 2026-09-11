@@ -1,57 +1,9 @@
-"""
-Retrieval-guided DDIM generation for LDP-DiffTraj.
+"""Server-ready retrieval-guided generation: one scalar weight per trajectory.
 
-Idea
-----
-We only GENERATE the private (privacy_score > 0) trajectories, but during the
-late denoising stage we steer them toward the manifold of CLEAN
-(privacy_score == 0) trajectories via a two-stage retrieval, *without ever
-copying a clean trajectory*. Only a soft, norm-clipped weighted noise direction
-implied by the retrieved clean trajectories is mixed into the model's predicted
-noise.
-
-Pipeline per private sample
----------------------------
-  for t from T down to 0 (DDIM):
-      eps_theta = unet(x_t, t, attr)
-      if t <= t_i:                          # t_i = training timestep (see below)
-          # Stage-2 fine retrieval among the sample's top_m head-neighbours
-          x0_retr   = weighted_avg_k( x0_clean[k] )    # k in top_k by D
-          eps_retr  = (x_t - sqrt(abar_t) * x0_retr) / sqrt(1 - abar_t)
-          eps_retr  = norm_clip(eps_retr, clip_norm * ||eps_theta||)
-          eps_theta = (1-guide_lambda)*eps_theta + guide_lambda*eps_retr
-      x_{t-1} = p_xt(x_t, eps_theta, t, next_t, beta, eta)
-
-Stage-1 (coarse, head-level) depends only on the (fixed) private/clean head
-features, so it is precomputed ONCE and reused for every noise level and
-guidance level. Stage-2 (state/direction-level) is recomputed at every guided
-timestep because it depends on the current generated state x_t.
-
-Guidance-level sweep
---------------------
-`--guide_lambdas` (default "0.1,0.3,0.5,0.7,0.9,1.0") generates one set of
-trajectories per level. All levels for a given batch share the SAME initial
-noise x_T (seeded by --seed), so a level only differs by how strongly the
-retrieval direction is mixed in. Each level is written to its own sub-folder
-`<result_root>/<run_tag>/guide_<level>/`, so nothing is overwritten.
-
-Timestep consistency with training (see 4-A-main-ldptraj.py:160)
-----------------------------------------------------------------
-Training uses `t_i = head_batch[:, -1].long()` where the head comes from the
-PER-NOISE file `noise_sweep/noise_{nl}/traj_features.npy`, whose LAST column
-stores the privacy-aligned diffusion timestep directly (integer, 1..~988).
-We therefore load t_i from that same per-noise file and use it as-is (.long()).
-The clean/private SPLIT and the conditioning features (first head_dim columns,
-verified identical across files) come from the global --head_path. If the
-per-noise training file is missing we fall back to scaling a normalized privacy
-score by --ti_max, with an explicit warning. Representation is auto-detected.
-
-Privacy notes
--------------
-  * No clean trajectory / clean id is ever stored or returned.
-  * Guidance is a soft weighted average of >=top_k clean *trajectories* turned
-    into a single noise direction; eps_retrieval is norm-clipped and tau is kept
-    >= ~0.5 so the nearest neighbour never dominates.
+Default: adaptive SNR k=0.1, gamma=1, lambda_max=1, categorical OD-ID cost=4.
+The weight is uniform across all points and constant over guided denoising steps.
+Guidance is active only for t <= t_i. Use --no-adaptive for a fixed-weight control.
+See README.md and run_adaptive_4cities.sh for generation and evaluation commands.
 """
 import argparse
 import torch
@@ -62,6 +14,8 @@ from tqdm import tqdm
 from types import SimpleNamespace
 from torch.utils.data import DataLoader, TensorDataset
 import pickle
+import json
+from scipy.stats import rankdata
 
 from utils.Traj_UNet import *
 from utils.config import args
@@ -101,12 +55,44 @@ def parse_args():
     # retrieval guidance
     p.add_argument('--top_m', type=int, default=500, help='Stage-1 coarse candidates per sample')
     p.add_argument('--top_k', type=int, default=20, help='Stage-2 fine neighbours used for guidance')
-    p.add_argument('--guide_lambdas', type=str, default='0.1,0.3,0.5,0.7,0.9,1.0',
+    p.add_argument('--guide_lambdas', type=str, default='1.0',
                    help='Comma-separated guidance levels to sweep. Each level is generated '
                         'independently and saved to its own sub-folder guide_<level>/. '
                         'A single value (e.g. "0.1") runs just that level.')
     p.add_argument('--guide_lambda', type=float, default=0.1,
                    help='[deprecated] single mixing weight; used only when --guide_lambdas is empty.')
+    # adaptive (per-trajectory) guidance strength
+    p.add_argument('--adaptive', action=argparse.BooleanOptionalAction, default=True,
+                   help='Per-trajectory adaptive guidance: noisier trajectories (larger t_i) '
+                        'are guided more strongly, cleaner ones more weakly. Each value in '
+                        '--guide_lambdas is then the PEAK strength lam_max.')
+    p.add_argument('--lam_ratio_min', type=float, default=0.0,
+                   help='[adaptive] lam_min = lam_ratio_min * lam_max, i.e. the strength given '
+                        'to the cleanest trajectories. 0 => they get no guidance at all.')
+    p.add_argument('--adapt_gamma', type=float, default=1.0,
+                   help='[adaptive] lambda_i = lam_min + (lam_max-lam_min)*s_i**adapt_gamma. '
+                        '>1 reserves strong guidance for the noisiest tail, <1 spreads it out.')
+    p.add_argument('--adapt_key', type=str, default='ti', choices=['ti', 'privacy'],
+                   help='[adaptive] noisiness measure: "ti" = per-noise-level diffusion timestep '
+                        'actually used to perturb the trajectory (recommended); "privacy" = '
+                        'global privacy score column of --head_path.')
+    p.add_argument('--adapt_norm', type=str, default='snr',
+                   choices=['rank', 'relative', 'absolute', 'snr'],
+                   help='[adaptive] "relative" = quantile-clipped min-max over the private set '
+                        'of the current noise level; "absolute" = s_i = t_i/(n_steps-1), '
+                        'comparable across noise levels; "rank" = empirical-CDF rank, immune '
+                        'to the heavy right skew of t_i; "snr" uses actual diffusion '
+                        'noise-to-signal odds (requires --adapt_key ti).')
+    p.add_argument('--adapt_snr_scale', type=float, default=0.1,
+                   help='[adaptive, snr] positive k in s=(1-abar)/(1-abar+k*abar). '
+                        'Smaller k gives stronger guidance at the SAME t_i. '
+                        'This scale is a tuning parameter, not an optimality guarantee.')
+    p.add_argument('--head_id_weight', type=float, default=4.0,
+                   help='Nonnegative categorical OD-ID mismatch cost in coarse AND fine '
+                        'retrieval. Positive values stop treating ID numbers as coordinates. '
+                        'Uses existing conditioning IDs and clean-reference IDs only.')
+    p.add_argument('--adapt_q', type=float, default=0.05,
+                   help='[adaptive, relative] quantile clipped at each end before min-max.')
     p.add_argument('--tau', type=float, default=1.0, help='Softmax temperature (keep >= ~0.5)')
     p.add_argument('--lambda_state', type=float, default=1.0, help='Weight of state distance D_state')
     p.add_argument('--lambda_vel', type=float, default=1.0, help='Weight of direction distance D_vel')
@@ -116,7 +102,18 @@ def parse_args():
     p.add_argument('--ti_max', type=int, default=-1,
                    help='Fallback t_i = clamp(privacy_score * ti_max). -1 => num_diffusion_timesteps')
     p.add_argument('--seed', type=int, default=0, help='Seed for the fixed clean noise eps_clean')
-    return p.parse_args()
+    parsed = p.parse_args()
+    if not np.isfinite(parsed.adapt_gamma) or parsed.adapt_gamma <= 0:
+        p.error('--adapt_gamma must be finite and > 0 for monotone guidance')
+    if not 0 <= parsed.lam_ratio_min <= 1:
+        p.error('--lam_ratio_min must be in [0, 1]')
+    if not np.isfinite(parsed.adapt_snr_scale) or parsed.adapt_snr_scale <= 0:
+        p.error('--adapt_snr_scale must be finite and > 0')
+    if parsed.adaptive and parsed.adapt_norm == 'snr' and parsed.adapt_key != 'ti':
+        p.error('--adapt_norm snr requires --adapt_key ti')
+    if not np.isfinite(parsed.head_id_weight) or parsed.head_id_weight < 0:
+        p.error('--head_id_weight must be finite and >= 0')
+    return parsed
 
 
 cli_args = parse_args()
@@ -127,6 +124,10 @@ os.environ["CUDA_VISIBLE_DEVICES"] = cli_args.cuda_device
 # =========================
 temp = {k: SimpleNamespace(**v) for k, v in args.items()}
 config = SimpleNamespace(**temp)
+if not 1 <= cli_args.timesteps <= config.diffusion.num_diffusion_timesteps:
+    raise ValueError('--timesteps must be between 1 and the configured diffusion steps')
+if cli_args.batch_size < 1:
+    raise ValueError('--batch_size must be positive')
 
 device = "cuda"
 L = config.data.traj_length
@@ -200,7 +201,14 @@ if cli_args.guide_lambdas.strip():
     guide_lambdas = [float(s) for s in cli_args.guide_lambdas.split(",") if s.strip()]
 else:
     guide_lambdas = [cli_args.guide_lambda]
-print("Guidance levels to generate:", guide_lambdas)
+if not guide_lambdas or any(not np.isfinite(gl) or not 0 <= gl <= 1 for gl in guide_lambdas):
+    raise ValueError('Guidance weights/peaks must be finite values in [0,1]')
+if cli_args.adaptive:
+    print("Guidance levels to generate (ADAPTIVE, value = peak lam_max):", guide_lambdas)
+    print(f"  lam_min = {cli_args.lam_ratio_min:g} * lam_max | gamma={cli_args.adapt_gamma:g} "
+          f"| key={cli_args.adapt_key} | norm={cli_args.adapt_norm} | q={cli_args.adapt_q:g}")
+else:
+    print("Guidance levels to generate (FIXED):", guide_lambdas)
 
 
 # =========================
@@ -214,7 +222,12 @@ def precompute_cand_idx():
     for s in range(0, Np, cli_args.batch_size):
         feat = private_attr[s:s + cli_args.batch_size].to(device)
         feat = (feat - feat_mean) / feat_std                              # [b,HEAD_DIM]
-        d_head = torch.cdist(feat, clean_feat_n)                          # [b,Nc]
+        if cli_args.head_id_weight > 0:
+            query_ids = private_attr[s:s + cli_args.batch_size, 6:8].to(device)
+            mismatch = (query_ids[:, None, :] != clean_feat[None, :, 6:8]).float().sum(-1)
+            d_head = torch.cdist(feat[:, :6], clean_feat_n[:, :6]) + cli_args.head_id_weight * mismatch
+        else:
+            d_head = torch.cdist(feat, clean_feat_n)                      # [b,Nc]
         ci = torch.topk(d_head, cli_args.top_m, largest=False, dim=1).indices
         idx_chunks.append(ci.cpu())
     return torch.cat(idx_chunks, dim=0)                                   # [Np,top_m] (cpu)
@@ -261,9 +274,63 @@ def load_ti(noise_level):
 
 
 # =========================
+# 3c. Adaptive guidance strength: per-trajectory noisiness -> lambda_i
+# =========================
+def noisiness_scores(private_ti):
+    """Per-private-trajectory noisiness s in [0,1] (larger = noisier).
+
+    Returns (s [Np] float cpu tensor, human-readable description).
+    """
+    if cli_args.adapt_key == 'ti':
+        raw = private_ti.float().numpy()
+        raw_desc = 't_i (per-noise diffusion timestep)'
+    else:
+        raw = head_np[private_idx, -1].astype(np.float64)
+        raw_desc = 'privacy score (global head last column)'
+
+    if cli_args.adapt_norm == 'snr':
+        # The same t_i gets the same score regardless of the other trajectories.
+        # Noise-to-signal odds grow monotonically with t_i for positive beta.
+        abar = alpha_bar_all.detach().cpu().numpy()[private_ti.numpy()]
+        noise_var = np.maximum(1.0 - abar, 0.0)
+        s = noise_var / (noise_var + cli_args.adapt_snr_scale * abar)
+        desc = f'diffusion noise odds / (odds + {cli_args.adapt_snr_scale:g}) (snr)'
+    elif cli_args.adapt_norm == 'absolute':
+        denom = float(n_steps - 1) if cli_args.adapt_key == 'ti' \
+            else max(float(np.nanmax(raw)), 1e-8)
+        s = np.clip(raw / denom, 0.0, 1.0)
+        desc = f'{raw_desc} / {denom:g} (absolute)'
+    elif cli_args.adapt_norm == 'rank':
+        # Empirical CDF. t_i is heavily right-skewed (median ~ 7% of max), so
+        # min-max collapses most trajectories to s~0; ranks spread them evenly
+        # and make s depend only on the ORDER of noisiness, not its scale.
+        r = rankdata(raw, method='average')
+        s = (r - 1.0) / max(len(r) - 1.0, 1.0)
+        desc = f'{raw_desc} empirical-CDF rank (rank)'
+    else:
+        q = float(np.clip(cli_args.adapt_q, 0.0, 0.49))
+        lo, hi = np.quantile(raw, q), np.quantile(raw, 1.0 - q)
+        if hi - lo < 1e-8:                      # degenerate spread (e.g. noise 0.00)
+            s = np.full_like(raw, 0.5, dtype=np.float64)
+            desc = f'{raw_desc}: spread ~0 (all == {float(lo):g}) -> s=0.5 for all'
+        else:
+            s = np.clip((raw - lo) / (hi - lo), 0.0, 1.0)
+            desc = (f'{raw_desc} min-max on [q{q:g}={float(lo):g}, '
+                    f'q{1 - q:g}={float(hi):g}] (relative)')
+    return torch.from_numpy(np.asarray(s, dtype=np.float32)), desc
+
+
+def lambda_vector(s, lam_max):
+    """s [.] in [0,1] -> per-sample mixing weight in [lam_min, lam_max]."""
+    lam_min = cli_args.lam_ratio_min * lam_max
+    lam = lam_min + (lam_max - lam_min) * s.clamp(0.0, 1.0).pow(cli_args.adapt_gamma)
+    return lam.clamp(0.0, 1.0)
+
+
+# =========================
 # 4. Retrieval guidance (Stage-2, vectorized over guided samples)
 # =========================
-def retrieval_noise(x_g, eps_g, cand_idx, i):
+def retrieval_noise(x_g, eps_g, cand_idx, i, query_attr=None):
     """
     x_g      : [G,2,Len]  current generated private states (guided subset)
     eps_g    : [G,2,Len]  model predicted noise for those samples
@@ -293,6 +360,10 @@ def retrieval_noise(x_g, eps_g, cand_idx, i):
     D_vel = 1.0 - cos                                            # [G,top_m]
 
     D = cli_args.lambda_state * D_state + cli_args.lambda_vel * D_vel   # [G,top_m]
+    if cli_args.head_id_weight > 0:
+        assert query_attr is not None, 'Categorical retrieval requires the conditioning attributes'
+        mismatch = (query_attr[:, None, 6:8] != clean_feat[cand_idx][:, :, 6:8]).float().sum(-1)
+        D = D + cli_args.head_id_weight * mismatch
 
     # top_k smallest distances -> softmax weights
     topv, topi = torch.topk(-D, cli_args.top_k, dim=1)           # [G,top_k]  (topv = -D)
@@ -330,24 +401,41 @@ def gl_tag(gl):
 # Fixed (non-guide) hyper-parameters share one parent folder; each guidance level
 # then gets its own sub-folder guide_<level>/ so runs never overwrite each other.
 # Override the parent name with --run_tag if desired.
+_adapt_tag = (
+    f"_adapt-{cli_args.adapt_key}-{cli_args.adapt_norm}"
+    f"_rmin{cli_args.lam_ratio_min:g}_g{cli_args.adapt_gamma:g}"
+) if cli_args.adaptive else ""
+if cli_args.adaptive and cli_args.adapt_norm == 'snr':
+    _adapt_tag += f'_snrk{cli_args.adapt_snr_scale:g}'
+if cli_args.head_id_weight > 0:
+    _adapt_tag += f'_idw{cli_args.head_id_weight:g}'
 run_tag = cli_args.run_tag.strip() or (
     f"m{cli_args.top_m}_k{cli_args.top_k}"
     f"_tau{cli_args.tau}_ls{cli_args.lambda_state}_lv{cli_args.lambda_vel}"
-    f"_clip{cli_args.clip_norm}"
+    f"_clip{cli_args.clip_norm}{_adapt_tag}_seed{cli_args.seed}"
 )
 RESULT_ROOT = os.path.join(cli_args.result_root, run_tag)
 level_dirs = {gl: os.path.join(RESULT_ROOT, gl_tag(gl)) for gl in guide_lambdas}
 for d in level_dirs.values():
     os.makedirs(d, exist_ok=True)
+with open(os.path.join(RESULT_ROOT, 'run_config.json'), 'w') as f:
+    json.dump(dict(arguments=vars(cli_args), diffusion=vars(config.diffusion),
+                   private_count=Np, clean_count=Nc, uniform_per_trajectory=True), f, indent=2)
+np.save(os.path.join(RESULT_ROOT, 'private_indices.npy'), private_idx)
 print(f"Output parent: {RESULT_ROOT}")
 for gl, d in level_dirs.items():
-    print(f"  guide_lambda={gl:g} -> {d}")
+    label = "lam_max" if cli_args.adaptive else "guide_lambda"
+    print(f"  {label}={gl:g} -> {d}")
 
 noise_dirs = sorted(d for d in os.listdir(ROOT) if d.startswith(cli_args.noise_prefix))
 if cli_args.noise_levels.strip():
     wanted = {s.strip() for s in cli_args.noise_levels.split(",") if s.strip()}
     noise_dirs = [d for d in noise_dirs if d.split("noise_")[1].split("_")[0] in wanted]
-    assert noise_dirs, f"None of {wanted} found under {ROOT}"
+    missing = wanted - {d.split('noise_')[1].split('_')[0] for d in noise_dirs}
+    if missing:
+        raise FileNotFoundError(f'Missing requested model noise levels under {ROOT}: {sorted(missing)}')
+if not noise_dirs:
+    raise FileNotFoundError(f'No model directories matching {cli_args.noise_prefix} under {ROOT}')
 print("Processing noise levels:", noise_dirs)
 
 idx_all = torch.arange(Np)
@@ -371,16 +459,28 @@ for noise_dir in noise_dirs:
     private_ti, ti_src = load_ti(noise_level)
     print(f"t_i source: {ti_src}  | t_i[min,max]=({int(private_ti.min())},{int(private_ti.max())})")
 
-    loader = DataLoader(TensorDataset(private_attr, private_ti, idx_all),
+    # per-trajectory noisiness -> adaptive strength (constant within a noise level)
+    if cli_args.adaptive:
+        private_s, s_src = noisiness_scores(private_ti)
+        print(f"adaptive noisiness: {s_src}")
+        for gl in guide_lambdas:
+            lv = lambda_vector(private_s, gl)
+            print(f"  lam_max={gl:g} -> lambda_i in [{float(lv.min()):.3f}, "
+                  f"{float(lv.max()):.3f}], mean {float(lv.mean()):.3f}")
+    else:
+        private_s = torch.zeros(Np, dtype=torch.float32)
+
+    loader = DataLoader(TensorDataset(private_attr, private_ti, private_s, idx_all),
                         batch_size=cli_args.batch_size, shuffle=False)
 
     # one output list per guidance level for this noise level
     gen_by_level = {gl: [] for gl in guide_lambdas}
 
-    for b_i, (attr_b, ti_b, idx_b) in enumerate(
+    for b_i, (attr_b, ti_b, s_b, idx_b) in enumerate(
             tqdm(loader, desc=f"Generating ({noise_level})")):
         attr_b = attr_b.to(device)                    # [B,HEAD_DIM] conditioning (matches training)
         ti_b = ti_b.to(device)                        # [B]
+        s_b = s_b.to(device)                          # [B] noisiness in [0,1]
         cand_idx = cand_idx_all[idx_b].to(device)     # [B,top_m] precomputed Stage-1
         B = attr_b.shape[0]
 
@@ -391,6 +491,8 @@ for noise_dir in noise_dirs:
         x0_init = torch.randn(B, 2, L, generator=g_init).to(device)
 
         for gl in guide_lambdas:
+            # fixed mode: scalar weight; adaptive mode: one weight per trajectory
+            lam_b = lambda_vector(s_b, gl) if cli_args.adaptive else None
             x = x0_init.clone()
             ims = []
             for i, j in zip(reversed(seq), reversed(seq_next)):
@@ -403,8 +505,9 @@ for noise_dir in noise_dirs:
                     guide_mask = (i <= ti_b)                          # [B] bool
                     if guide_mask.any():
                         gi = guide_mask.nonzero(as_tuple=True)[0]     # [G]
-                        eps_retr = retrieval_noise(x[gi], pred_noise[gi], cand_idx[gi], i)
-                        pred_noise[gi] = (1.0 - gl) * pred_noise[gi] + gl * eps_retr
+                        eps_retr = retrieval_noise(x[gi], pred_noise[gi], cand_idx[gi], i, attr_b[gi])
+                        lam_g = gl if lam_b is None else lam_b[gi].view(-1, 1, 1)
+                        pred_noise[gi] = (1.0 - lam_g) * pred_noise[gi] + lam_g * eps_retr
 
                     x = p_xt(x, pred_noise, t, next_t, beta, eta)
                     if i % 10 == 0:
@@ -419,6 +522,12 @@ for noise_dir in noise_dirs:
         save_path = os.path.join(level_dirs[gl], f"Gen_traj_noise_{noise_level}_guided.pkl")
         with open(save_path, "wb") as f:
             pickle.dump(gen_by_level[gl], f)
-        print(f"Saved -> {save_path}  ({len(gen_by_level[gl])} trajs, guide_lambda={gl:g})")
+        if cli_args.adaptive:
+            lam_path = os.path.join(level_dirs[gl], f"guide_lambda_noise_{noise_level}.npy")
+            np.save(lam_path, lambda_vector(private_s, gl).numpy())
+            print(f"Saved -> {save_path}  ({len(gen_by_level[gl])} trajs, "
+                  f"adaptive lam_max={gl:g}; per-traj lambdas -> {lam_path})")
+        else:
+            print(f"Saved -> {save_path}  ({len(gen_by_level[gl])} trajs, guide_lambda={gl:g})")
 
 print("\n🎉 All noise levels x guidance levels finished (retrieval-guided).")

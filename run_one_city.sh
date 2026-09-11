@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the full 0->6 pipeline for one city.
+# Run preprocessing -> LDP training -> uniform adaptive generation -> evaluation.
 #
 # Usage:
 #   bash run_one_city.sh <city> <north_lat> <south_lat> <west_lon> <east_lon>
@@ -73,50 +73,8 @@ python 3-traj-privacy-compact.py \
     --city        "${CITY}" \
     --output-root "${TRAJ_PRIV_OUT}"
 
-# Step 4 — train diffusion models (LDP + DP).
-python 4-A-main-ldptraj.py --dataset "${CITY}"
-python 4-B-main-dptraj.py  --dataset "${CITY}"
+# Step 4: train LDP; generation/evaluation can also be run separately.
+CUDA_VISIBLE_DEVICES="${CUDA_DEVICE:-0}" python 4-A-main-ldptraj.py --dataset "${CITY}"
 
-# Step 5 — generate trajectories from each trained model.
-python 5-A-traj_gen_iterative_ldp.py \
-    --head_path    "${TRAJ_PRIV_OUT}/trajectory_features.npy" \
-    --root         "./LDP-DiffTraj_${CITY}" \
-    --result_root  "./LDP_result_${CITY}" \
-    --noise_prefix "${CITY}_noise_"
-
-python 5-B-traj_gen_iterative_dp.py \
-    --head_path    "${TRAJ_PRIV_OUT}/trajectory_features.npy" \
-    --root         "./DPTraj_${CITY}" \
-    --result_root  "./DP_result_${CITY}" \
-    --noise_prefix "${CITY}_noise_"
-
-# Step 6 — evaluate (one summary CSV per method).
-python 6-eval_metrics_iterative.py \
-    --feature_file   "${TRAJ_PRIV_OUT}/trajectory_features.npy" \
-    --real_traj_file "${TRAJ_PRIV_OUT}/noise_sweep/noise_0.00/traj.npy" \
-    --gen_dir        "./LDP_result_${CITY}"
-
-python 6-eval_metrics_iterative.py \
-    --feature_file   "${TRAJ_PRIV_OUT}/trajectory_features.npy" \
-    --real_traj_file "${TRAJ_PRIV_OUT}/noise_sweep/noise_0.00/traj.npy" \
-    --gen_dir        "./DP_result_${CITY}"
-
-echo
-echo "==> ${CITY}: pipeline finished."
-echo "    LDP metrics: ./LDP_result_${CITY}/metrics_summary.csv"
-echo "    DP  metrics: ./DP_result_${CITY}/metrics_summary.csv"
-echo
-echo "After all 4 cities are done, render the joint plot with:"
-echo
-echo "  python 7-plot_metrics.py \\"
-echo "      --csv ./LDP_result_tokyo/metrics_summary.csv \\"
-echo "            ./LDP_result_osaka/metrics_summary.csv \\"
-echo "            ./LDP_result_nagoya/metrics_summary.csv \\"
-echo "            ./LDP_result_sapporo/metrics_summary.csv \\"
-echo "            ./DP_result_tokyo/metrics_summary.csv \\"
-echo "            ./DP_result_osaka/metrics_summary.csv \\"
-echo "            ./DP_result_nagoya/metrics_summary.csv \\"
-echo "            ./DP_result_sapporo/metrics_summary.csv \\"
-echo "      --label LDP-tokyo LDP-osaka LDP-nagoya LDP-sapporo \\"
-echo "              DP-tokyo  DP-osaka  DP-nagoya  DP-sapporo \\"
-echo "      --out   figs/metrics_4cities.png"
+# Uniform adaptive generation, metrics, and city plot.
+bash run_adaptive_4cities.sh "${CITY}"

@@ -1,17 +1,21 @@
 """
 Plot evaluation metrics produced by 6-eval_metrics_iterative.py
-into a 2x3 grid: SSIM-OD-avg, SSIM-occupancy, Top-K F1,
-                 length JSD, high-sens OD JSD, high-sens occupancy JSD.
+into a 3x3 grid: three reference metrics and six legacy metrics.
 
 Supports overlaying multiple CSVs (e.g. LDP vs DP vs baseline noise_sweep).
 """
 import argparse
 import os
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
 METRICS = [
+    ("od_ssim_vst", "OD-SSIM (VST, reference grid)", "↑"),
+    ("od_jsd", "OD JSD (reference grid)", "↓"),
+    ("step_length_jsd", "Step-length JSD", "↓"),
     ("ssim_od_avg",            "SSIM (OD avg)",                "↑"),
     ("ssim_occupancy",         "SSIM (occupancy)",             "↑"),
     ("topk_f1",                "Top-K F1",                     "↑"),
@@ -51,7 +55,7 @@ def main():
 
     os.makedirs(os.path.dirname(cli.out) or '.', exist_ok=True)
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12), sharex=True)
     axes = axes.flatten()
 
     for ax, (col, name, arrow) in zip(axes, METRICS):

@@ -93,7 +93,7 @@ dataloader = DataLoader(
 print("Total heads:", len(head))
 
 # =========================
-# 4. Paths（🔥关键）
+# 4. Paths
 # =========================
 ROOT = cli_args.root
 RESULT_ROOT = cli_args.result_root
@@ -112,7 +112,7 @@ print("Found noise levels:", noise_dirs)
 for noise_dir in noise_dirs:
     print(f"\n===== Processing {noise_dir} =====")
 
-    # 解析 noise level，用于命名
+    # Parse the noise level for output filenames
     noise_level = noise_dir.split("noise_")[1].split("_")[0]
 
     model_root = os.path.join(ROOT, noise_dir, "models")
@@ -161,7 +161,7 @@ for noise_dir in noise_dirs:
             Gen_traj.append(trajs[b].T.astype(float))
 
     # =========================
-    # 8. Save result（🔥统一目录）
+    # 8. Save result to the shared output directory
     # =========================
     save_path = os.path.join(
         RESULT_ROOT,
